@@ -20,6 +20,7 @@ import { attachSessionIdToErrorResponse } from "./error-session-id";
 import {
   ALL_PROVIDERS_UNAVAILABLE_MESSAGE,
   getErrorOverrideAsync,
+  hasMatchedErrorRuleWithoutOverrideResponse,
   isEmptyResponseError,
   isRateLimitError,
   ProxyError,
@@ -118,11 +119,13 @@ export function resolveFinalClientErrorMessage({
   currentFallbackMessage,
   settings,
   override,
+  matchedRuleWithoutOverride,
 }: {
   error: unknown;
   currentFallbackMessage: string;
   settings?: Pick<SystemSettings, "passThroughUpstreamErrorMessage"> | null;
   override?: ErrorOverrideForMessageResolver;
+  matchedRuleWithoutOverride?: boolean;
 }): string {
   if (override?.response) {
     return currentFallbackMessage;
@@ -137,7 +140,10 @@ export function resolveFinalClientErrorMessage({
     error,
     strippedFallback
   );
-  const shouldPassThrough = settings?.passThroughUpstreamErrorMessage ?? true;
+  const isRuleMatchedWithoutResponseOverride =
+    matchedRuleWithoutOverride ?? hasMatchedErrorRuleWithoutOverrideResponse(error);
+  const shouldPassThrough =
+    isRuleMatchedWithoutResponseOverride || (settings?.passThroughUpstreamErrorMessage ?? true);
   if (!shouldPassThrough) {
     return fallback;
   }
@@ -145,12 +151,11 @@ export function resolveFinalClientErrorMessage({
   if (error instanceof ProxyError) {
     return (
       deriveClientSafeUpstreamErrorMessage({
-        rawText: error.upstreamError?.rawBody,
-        candidateMessage:
-          error.upstreamError?.safeClientMessageCandidate ??
-          error.upstreamError?.body ??
-          error.message,
+        rawText: error.upstreamError?.rawBody ?? error.upstreamError?.body,
+        candidateMessage: error.upstreamError?.safeClientMessageCandidate,
+        candidateMessages: [error.upstreamError?.body, error.message],
         providerName: error.upstreamError?.providerName ?? null,
+        allowDefaultProviderLabels: isRuleMatchedWithoutResponseOverride,
       }) ?? fallback
     );
   }

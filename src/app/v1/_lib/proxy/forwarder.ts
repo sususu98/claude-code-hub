@@ -9105,10 +9105,8 @@ export class ProxyForwarder {
         finalError.upstreamError?.body)
         ? (deriveClientSafeUpstreamErrorMessage({
             rawText: finalError.upstreamError?.rawBody ?? finalError.upstreamError?.body,
-            candidateMessage:
-              finalError.upstreamError?.safeClientMessageCandidate ??
-              finalError.upstreamError?.body ??
-              finalError.message,
+            candidateMessage: finalError.upstreamError?.safeClientMessageCandidate,
+            candidateMessages: [finalError.upstreamError?.body, finalError.message],
             providerName: finalError.upstreamError?.providerName ?? null,
           }) ?? undefined)
         : undefined;

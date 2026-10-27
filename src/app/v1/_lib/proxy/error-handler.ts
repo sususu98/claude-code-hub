@@ -114,6 +114,11 @@ function getGenericProxyErrorFallbackMessage(
   }
 }
 
+/**
+ * 解析最终返回给客户端的错误消息
+ *
+ * 优先级：显式覆写响应体 > 命中无覆写错误规则白名单透传 > 系统设置上游错误透传 > 通用状态码兜底文案
+ */
 export function resolveFinalClientErrorMessage({
   error,
   currentFallbackMessage,
@@ -394,6 +399,7 @@ export class ProxyErrorHandler {
                 currentFallbackMessage: clientErrorMessage,
                 settings,
                 override: { response: null, statusCode: override.statusCode },
+                matchedRuleWithoutOverride: false,
               });
               return await finalizeErrorResponse(
                 ProxyResponses.buildError(
@@ -413,6 +419,7 @@ export class ProxyErrorHandler {
               currentFallbackMessage: clientErrorMessage,
               settings,
               override: { response: null, statusCode: null },
+              matchedRuleWithoutOverride: false,
             });
             return await finalizeErrorResponse(
               ProxyResponses.buildError(
@@ -444,6 +451,7 @@ export class ProxyErrorHandler {
             currentFallbackMessage: clientErrorMessage,
             settings,
             override: hasExplicitOverrideMessage ? override : null,
+            matchedRuleWithoutOverride: false,
           });
           const responseBody = {
             ...override.response,

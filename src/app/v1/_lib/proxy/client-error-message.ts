@@ -163,6 +163,9 @@ function deriveCandidateFromRawText(rawText: string | undefined): string | null 
   return detected.detail;
 }
 
+/**
+ * 从上游原始响应文本或候选消息中提取并脱敏可安全返回给客户端的错误消息
+ */
 export function deriveClientSafeUpstreamErrorMessage(
   input: DeriveClientSafeUpstreamErrorMessageInput
 ): string | null {

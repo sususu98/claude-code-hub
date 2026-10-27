@@ -758,7 +758,11 @@ export function hasMatchedErrorRuleWithoutOverrideResponse(error: unknown): bool
     return false;
   }
   const cached = errorDetectionCache.get(error);
-  return cached?.matched === true && !cached.overrideResponse;
+  return (
+    cached?.matched === true &&
+    !cached.overrideResponse &&
+    cached.hasConfiguredOverrideResponse !== true
+  );
 }
 
 /**

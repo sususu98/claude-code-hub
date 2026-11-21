@@ -6,6 +6,7 @@ import { and, eq, gte, inArray, isNull, lt, sql } from "drizzle-orm";
 import { db } from "@/drizzle/db";
 import { keys, messageRequest, usageLedger } from "@/drizzle/schema";
 import { TTLMap } from "@/lib/cache/ttl-map";
+import { Decimal } from "@/lib/utils/currency";
 import { resolveSystemTimezone } from "@/lib/utils/timezone";
 import type {
   DatabaseKey,
@@ -613,17 +614,22 @@ async function sumTotalCostWithCutoffs(
     const valueRows = chunk.map((entry) =>
       entityType === "user"
         ? sql`(${entry.entityKey as number}::int, ${entry.cutoff.toISOString()}::timestamptz)`
-        : sql`(${entry.entityKey as string}::text, ${entry.cutoff.toISOString()}::timestamptz)`
+        : sql`(${entry.entityKey as string}::varchar, ${entry.cutoff.toISOString()}::timestamptz)`
     );
 
+    // Use CROSS JOIN LATERAL so PostgreSQL performs an Index Only Scan on
+    // idx_usage_ledger_user_cost_cover / idx_usage_ledger_key_cost per entity
+    // instead of degrading into a single-threaded Hash Right Join Seq Scan.
     const rows = await db.execute(sql`
-      SELECT c.entity_id AS entity_id, COALESCE(SUM(${usageLedger.costUsd}), 0) AS total
+      SELECT c.entity_id AS entity_id, COALESCE(agg.total, 0) AS total
       FROM (VALUES ${sql.join(valueRows, sql`, `)}) AS c(entity_id, cutoff)
-      LEFT JOIN ${usageLedger}
-        ON ${entityColumn} = c.entity_id
-       AND ${usageLedger.createdAt} >= c.cutoff
-       AND ${LEDGER_BILLING_CONDITION}
-      GROUP BY c.entity_id
+      CROSS JOIN LATERAL (
+        SELECT SUM(${usageLedger.costUsd}) AS total
+        FROM ${usageLedger}
+        WHERE ${entityColumn} = c.entity_id
+          AND ${usageLedger.createdAt} >= c.cutoff
+          AND ${LEDGER_BILLING_CONDITION}
+      ) AS agg
     `);
 
     for (const row of Array.from(rows) as Array<{ entity_id: unknown; total: unknown }>) {
@@ -776,6 +782,349 @@ export async function sumKeyTotalCostBatchByIds(
   }
 
   return result;
+}
+
+export interface UserTimeRangeCostEntry {
+  userId: number;
+  startTime: Date;
+  endTime: Date;
+}
+
+export interface KeyTimeRangeCostEntry {
+  keyId: number;
+  key: string;
+  startTime: Date;
+  endTime: Date;
+}
+
+export interface UserTotalCostTarget {
+  userId: number;
+  resetAt?: Date | null;
+}
+
+export interface KeyTotalCostTarget {
+  keyId: number;
+  key: string;
+  resetAt?: Date | null;
+}
+
+export interface UserAndKeyTotalCostResult {
+  userCosts: Map<number, number>;
+  keyCosts: Map<number, number>;
+}
+
+// Keep combined single-pass VALUES parameter count well below PostgreSQL's 65,535 bind limit.
+const SINGLE_PASS_TOTAL_COST_MAX_PARAMS = 50000;
+
+/**
+ * Batch query: sum user cost for per-user [startTime, endTime) windows using
+ * a single VALUES + CROSS JOIN LATERAL statement per chunk.
+ * Uses idx_usage_ledger_user_cost_cover without N+1 roundtrips.
+ */
+export async function sumUserCostInTimeRangesBatch(
+  entries: readonly UserTimeRangeCostEntry[]
+): Promise<Map<number, number>> {
+  const result = new Map<number, number>();
+  if (entries.length === 0) return result;
+
+  const deduped = new Map<number, UserTimeRangeCostEntry>();
+  for (const entry of entries) {
+    result.set(entry.userId, 0);
+    deduped.set(entry.userId, entry);
+  }
+
+  const queryable = [...deduped.values()].filter(
+    (entry) =>
+      entry.startTime instanceof Date &&
+      entry.endTime instanceof Date &&
+      !Number.isNaN(entry.startTime.getTime()) &&
+      !Number.isNaN(entry.endTime.getTime()) &&
+      entry.startTime < entry.endTime
+  );
+
+  for (let start = 0; start < queryable.length; start += TOTAL_COST_CUTOFF_CHUNK_SIZE) {
+    const chunk = queryable.slice(start, start + TOTAL_COST_CUTOFF_CHUNK_SIZE);
+    const valueRows = chunk.map(
+      (entry) =>
+        sql`(${entry.userId}::int, ${entry.startTime.toISOString()}::timestamptz, ${entry.endTime.toISOString()}::timestamptz)`
+    );
+
+    const rows = await db.execute(sql`
+      SELECT c.user_id AS user_id, COALESCE(agg.total, 0) AS total
+      FROM (VALUES ${sql.join(valueRows, sql`, `)}) AS c(user_id, start_time, end_time)
+      CROSS JOIN LATERAL (
+        SELECT SUM(${usageLedger.costUsd}) AS total
+        FROM ${usageLedger}
+        WHERE ${usageLedger.userId} = c.user_id
+          AND ${usageLedger.createdAt} >= c.start_time
+          AND ${usageLedger.createdAt} < c.end_time
+          AND ${LEDGER_BILLING_CONDITION}
+      ) AS agg
+    `);
+
+    for (const row of Array.from(rows) as Array<{ user_id: unknown; total: unknown }>) {
+      const userId = Number(row.user_id);
+      if (result.has(userId)) {
+        result.set(userId, Number(row.total || 0));
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Batch query: sum key cost for per-key [startTime, endTime) windows using
+ * a single VALUES + CROSS JOIN LATERAL statement per chunk.
+ * Uses idx_usage_ledger_key_cost without extra keys table lookups.
+ */
+export async function sumKeyCostInTimeRangesBatch(
+  entries: readonly KeyTimeRangeCostEntry[]
+): Promise<Map<number, number>> {
+  const result = new Map<number, number>();
+  if (entries.length === 0) return result;
+
+  const deduped = new Map<number, KeyTimeRangeCostEntry>();
+  for (const entry of entries) {
+    result.set(entry.keyId, 0);
+    deduped.set(entry.keyId, entry);
+  }
+
+  const queryable = [...deduped.values()].filter(
+    (entry) =>
+      entry.key.length > 0 &&
+      entry.startTime instanceof Date &&
+      entry.endTime instanceof Date &&
+      !Number.isNaN(entry.startTime.getTime()) &&
+      !Number.isNaN(entry.endTime.getTime()) &&
+      entry.startTime < entry.endTime
+  );
+
+  for (let start = 0; start < queryable.length; start += TOTAL_COST_CUTOFF_CHUNK_SIZE) {
+    const chunk = queryable.slice(start, start + TOTAL_COST_CUTOFF_CHUNK_SIZE);
+    const valueRows = chunk.map(
+      (entry) =>
+        sql`(${entry.keyId}::int, ${entry.key}::varchar, ${entry.startTime.toISOString()}::timestamptz, ${entry.endTime.toISOString()}::timestamptz)`
+    );
+
+    const rows = await db.execute(sql`
+      SELECT c.key_id AS key_id, COALESCE(agg.total, 0) AS total
+      FROM (VALUES ${sql.join(valueRows, sql`, `)}) AS c(key_id, key_str, start_time, end_time)
+      CROSS JOIN LATERAL (
+        SELECT SUM(${usageLedger.costUsd}) AS total
+        FROM ${usageLedger}
+        WHERE ${usageLedger.key} = c.key_str
+          AND ${usageLedger.createdAt} >= c.start_time
+          AND ${usageLedger.createdAt} < c.end_time
+          AND ${LEDGER_BILLING_CONDITION}
+      ) AS agg
+    `);
+
+    for (const row of Array.from(rows) as Array<{ key_id: unknown; total: unknown }>) {
+      const keyId = Number(row.key_id);
+      if (result.has(keyId)) {
+        result.set(keyId, Number(row.total || 0));
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Single-pass batch query for both user and key total costs (with independent
+ * per-user and per-key reset cutoffs).
+ *
+ * Scanning usage_ledger once and grouping by (user_id, kt.key_id) avoids running
+ * separate full-table scans for user totals, key totals, and reset-cutoff subsets.
+ */
+export async function sumUserAndKeyTotalCostBatch(
+  usersInput: readonly UserTotalCostTarget[],
+  keysInput: readonly KeyTotalCostTarget[],
+  maxAgeDays: number = Infinity
+): Promise<UserAndKeyTotalCostResult> {
+  const userCosts = new Map<number, number>();
+  const keyCosts = new Map<number, number>();
+
+  const dedupedUsers = new Map<number, { userId: number; cutoff: Date | null }>();
+  for (const user of usersInput) {
+    userCosts.set(user.userId, 0);
+    dedupedUsers.set(user.userId, {
+      userId: user.userId,
+      cutoff: resolveTotalCostCutoff(maxAgeDays, user.resetAt),
+    });
+  }
+
+  const dedupedKeys = new Map<string, { keyId: number; key: string; cutoff: Date | null }>();
+  for (const keyEntry of keysInput) {
+    keyCosts.set(keyEntry.keyId, 0);
+    if (keyEntry.key.length > 0) {
+      dedupedKeys.set(keyEntry.key, {
+        keyId: keyEntry.keyId,
+        key: keyEntry.key,
+        cutoff: resolveTotalCostCutoff(maxAgeDays, keyEntry.resetAt),
+      });
+    }
+  }
+
+  const uniqueUsers = [...dedupedUsers.values()];
+  const uniqueKeys = [...dedupedKeys.values()];
+
+  if (uniqueUsers.length === 0 && uniqueKeys.length === 0) {
+    return { userCosts, keyCosts };
+  }
+
+  // Fallback to separate batch functions when one side is empty or bind count is extreme.
+  const estimatedParams = uniqueUsers.length * 2 + uniqueKeys.length * 3;
+  if (
+    uniqueUsers.length === 0 ||
+    uniqueKeys.length === 0 ||
+    estimatedParams > SINGLE_PASS_TOTAL_COST_MAX_PARAMS
+  ) {
+    const userResetAtMap = new Map<number, Date>();
+    for (const user of usersInput) {
+      if (isValidResetAt(user.resetAt)) {
+        userResetAtMap.set(user.userId, user.resetAt);
+      }
+    }
+    const keyResetAtMap = new Map<number, Date>();
+    for (const keyEntry of keysInput) {
+      if (isValidResetAt(keyEntry.resetAt)) {
+        keyResetAtMap.set(keyEntry.keyId, keyEntry.resetAt);
+      }
+    }
+
+    const [fallbackUsers, fallbackKeys] = await Promise.all([
+      uniqueUsers.length > 0
+        ? sumUserTotalCostBatch(
+            uniqueUsers.map((u) => u.userId),
+            maxAgeDays,
+            userResetAtMap.size > 0 ? userResetAtMap : undefined
+          )
+        : Promise.resolve(userCosts),
+      uniqueKeys.length > 0
+        ? sumKeyTotalCostBatchByIds(
+            uniqueKeys.map((k) => k.keyId),
+            maxAgeDays,
+            keyResetAtMap.size > 0 ? keyResetAtMap : undefined
+          )
+        : Promise.resolve(keyCosts),
+    ]);
+
+    for (const [id, cost] of fallbackUsers) {
+      userCosts.set(id, cost);
+    }
+    for (const [id, cost] of fallbackKeys) {
+      keyCosts.set(id, cost);
+    }
+    return { userCosts, keyCosts };
+  }
+
+  // If every target carries a cutoff (e.g. finite maxAgeDays or all entities reset),
+  // push the earliest cutoff down into the outer WHERE clause to prune older history.
+  let minCutoff: Date | null = null;
+  let allTargetsBounded = true;
+  for (const u of uniqueUsers) {
+    if (!u.cutoff) {
+      allTargetsBounded = false;
+      break;
+    }
+    if (!minCutoff || u.cutoff < minCutoff) {
+      minCutoff = u.cutoff;
+    }
+  }
+  if (allTargetsBounded) {
+    for (const k of uniqueKeys) {
+      if (!k.cutoff) {
+        allTargetsBounded = false;
+        break;
+      }
+      if (!minCutoff || k.cutoff < minCutoff) {
+        minCutoff = k.cutoff;
+      }
+    }
+  }
+  const minCutoffClause =
+    allTargetsBounded && minCutoff
+      ? sql`AND ${usageLedger.createdAt} >= ${minCutoff.toISOString()}::timestamptz`
+      : sql``;
+
+  const userValueRows = uniqueUsers.map((u) =>
+    u.cutoff
+      ? sql`(${u.userId}::int, ${u.cutoff.toISOString()}::timestamptz)`
+      : sql`(${u.userId}::int, NULL::timestamptz)`
+  );
+  const keyValueRows = uniqueKeys.map((k) =>
+    k.cutoff
+      ? sql`(${k.key}::varchar, ${k.keyId}::int, ${k.cutoff.toISOString()}::timestamptz)`
+      : sql`(${k.key}::varchar, ${k.keyId}::int, NULL::timestamptz)`
+  );
+
+  const rows = await db.execute(sql`
+    WITH user_targets(user_id, cutoff) AS (
+      VALUES ${sql.join(userValueRows, sql`, `)}
+    ),
+    key_targets(key_str, key_id, cutoff) AS (
+      VALUES ${sql.join(keyValueRows, sql`, `)}
+    )
+    SELECT
+      ${usageLedger.userId} AS user_id,
+      kt.key_id AS key_id,
+      COALESCE(
+        SUM(${usageLedger.costUsd}) FILTER (
+          WHERE ut.user_id IS NOT NULL
+            AND (ut.cutoff IS NULL OR ${usageLedger.createdAt} >= ut.cutoff)
+        ),
+        0
+      ) AS user_cost,
+      COALESCE(
+        SUM(${usageLedger.costUsd}) FILTER (
+          WHERE kt.key_id IS NOT NULL
+            AND (kt.cutoff IS NULL OR ${usageLedger.createdAt} >= kt.cutoff)
+        ),
+        0
+      ) AS key_cost
+    FROM ${usageLedger}
+    LEFT JOIN user_targets ut ON ut.user_id = ${usageLedger.userId}
+    LEFT JOIN key_targets kt ON kt.key_str = ${usageLedger.key}
+    WHERE (ut.user_id IS NOT NULL OR kt.key_id IS NOT NULL)
+      ${minCutoffClause}
+      AND ${LEDGER_BILLING_CONDITION}
+    GROUP BY ${usageLedger.userId}, kt.key_id
+  `);
+
+  const userDecimals = new Map<number, Decimal>();
+  const keyDecimals = new Map<number, Decimal>();
+
+  for (const row of Array.from(rows) as Array<{
+    user_id: unknown;
+    key_id: unknown;
+    user_cost: unknown;
+    key_cost: unknown;
+  }>) {
+    const userId = Number(row.user_id);
+    if (userCosts.has(userId) && row.user_cost != null) {
+      const prev = userDecimals.get(userId) ?? new Decimal(0);
+      userDecimals.set(userId, prev.plus(new Decimal(String(row.user_cost))));
+    }
+
+    if (row.key_id != null && row.key_cost != null) {
+      const keyId = Number(row.key_id);
+      if (keyCosts.has(keyId)) {
+        const prev = keyDecimals.get(keyId) ?? new Decimal(0);
+        keyDecimals.set(keyId, prev.plus(new Decimal(String(row.key_cost))));
+      }
+    }
+  }
+
+  for (const [userId, total] of userDecimals) {
+    userCosts.set(userId, total.toNumber());
+  }
+  for (const [keyId, total] of keyDecimals) {
+    keyCosts.set(keyId, total.toNumber());
+  }
+
+  return { userCosts, keyCosts };
 }
 
 /**

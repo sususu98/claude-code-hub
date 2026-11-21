@@ -4,7 +4,7 @@ import { NON_BILLING_ENDPOINTS } from "@/lib/utils/performance-formatter";
 
 const NON_BILLING_LEDGER_ENDPOINT_CONDITION = sql`(
   ${usageLedger.endpoint} IS NULL
-  OR LOWER(REGEXP_REPLACE(${usageLedger.endpoint}, '/+$', '')) NOT IN (
+  OR RTRIM(LOWER(${usageLedger.endpoint}), '/') NOT IN (
     ${sql.join(
       NON_BILLING_ENDPOINTS.map((endpoint) => sql`${endpoint}`),
       sql`, `

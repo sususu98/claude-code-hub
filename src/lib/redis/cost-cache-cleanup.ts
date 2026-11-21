@@ -2,6 +2,7 @@ import { logger } from "@/lib/logger";
 import { buildLeaseKey } from "@/lib/rate-limit/lease";
 import { getRedisClient } from "@/lib/redis";
 import { getKeyActiveSessionsKey, getUserActiveSessionsKey } from "@/lib/redis/active-session-keys";
+import { QUOTA_TOTAL_COST_CACHE_PREFIX } from "@/lib/redis/quota-total-cost-cache";
 import { scanPattern } from "@/lib/redis/scan-helper";
 
 export interface ClearUserCostCacheOptions {
@@ -192,6 +193,16 @@ export async function clearUserCostCache(
       });
       return [];
     }),
+    scanPattern(redis, `${QUOTA_TOTAL_COST_CACHE_PREFIX}*`)
+      .then((matched) => matched.filter((k) => !k.endsWith(":lock")))
+      .catch((err) => {
+        scanErrorCount += 1;
+        logger.warn("Failed to scan quota total cost cache pattern", {
+          userId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return [];
+      }),
   ]);
 
   const allCostKeys = scanResults
@@ -355,6 +366,15 @@ export async function clearSingleKeyCostCache(
       });
       return [];
     }),
+    scanPattern(redis, `${QUOTA_TOTAL_COST_CACHE_PREFIX}*`)
+      .then((matched) => matched.filter((k) => !k.endsWith(":lock")))
+      .catch((err) => {
+        logger.warn("Failed to scan quota total cost cache pattern", {
+          keyId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return [];
+      }),
   ]);
 
   const allCostKeys = scanResults.flat();

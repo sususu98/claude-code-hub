@@ -235,7 +235,7 @@ describe("clearUserCostCache", () => {
     });
 
     expect(getRedisClientMock).toHaveBeenCalledWith({ allowWhenRateLimitDisabled: true });
-    expect(result).toMatchObject({ cleanupFailed: true, errorCount: 4 });
+    expect(result).toMatchObject({ cleanupFailed: true, errorCount: 5 });
     expect(redisMock.pipeline).not.toHaveBeenCalled();
   });
 
@@ -362,6 +362,7 @@ describe("clearUserCostCache", () => {
     expect(calls).toContain("total_cost:user:10");
     expect(calls).toContain("total_cost:user:10:*");
     expect(calls).toContain("lease:user:10:*");
+    expect(calls).toContain("quota:users:total_cost:v1:*");
     // No key-specific patterns
     expect(calls.filter((p: string) => p.startsWith("key:"))).toHaveLength(0);
     expect(calls.filter((p: string) => p.startsWith("total_cost:key:"))).toHaveLength(0);

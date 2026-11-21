@@ -326,4 +326,118 @@ describe("statistics resetAt parameter", () => {
       expect(result.costTotal).toBe(10.0);
     });
   });
+
+  describe("sumUserCostInTimeRangesBatch", () => {
+    test("aggregates per-user time ranges in a single LATERAL query", async () => {
+      dbResultMock.mockReturnValueOnce([
+        { user_id: 1, total: "12.5" },
+        { user_id: 2, total: "0" },
+      ]);
+
+      const { sumUserCostInTimeRangesBatch } = await import("@/repository/statistics");
+      const start = new Date("2026-11-21T00:00:00Z");
+      const end = new Date("2026-11-21T12:00:00Z");
+      const result = await sumUserCostInTimeRangesBatch([
+        { userId: 1, startTime: start, endTime: end },
+        { userId: 2, startTime: start, endTime: end },
+        // Clipped start >= end should default to 0 without failing
+        { userId: 3, startTime: end, endTime: start },
+      ]);
+
+      expect(dbExecuteMock).toHaveBeenCalledTimes(1);
+      expect(result.get(1)).toBe(12.5);
+      expect(result.get(2)).toBe(0);
+      expect(result.get(3)).toBe(0);
+    });
+
+    test("returns empty map when entries are empty", async () => {
+      const { sumUserCostInTimeRangesBatch } = await import("@/repository/statistics");
+      const result = await sumUserCostInTimeRangesBatch([]);
+      expect(result.size).toBe(0);
+      expect(dbExecuteMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("sumKeyCostInTimeRangesBatch", () => {
+    test("aggregates per-key time ranges in a single LATERAL query", async () => {
+      dbResultMock.mockReturnValueOnce([
+        { key_id: 101, total: "3.25" },
+        { key_id: 102, total: "0.75" },
+      ]);
+
+      const { sumKeyCostInTimeRangesBatch } = await import("@/repository/statistics");
+      const start = new Date("2026-11-21T00:00:00Z");
+      const end = new Date("2026-11-21T12:00:00Z");
+      const result = await sumKeyCostInTimeRangesBatch([
+        { keyId: 101, key: "sk-101", startTime: start, endTime: end },
+        { keyId: 102, key: "sk-102", startTime: start, endTime: end },
+        { keyId: 103, key: "sk-103", startTime: end, endTime: start },
+      ]);
+
+      expect(dbExecuteMock).toHaveBeenCalledTimes(1);
+      expect(result.get(101)).toBe(3.25);
+      expect(result.get(102)).toBe(0.75);
+      expect(result.get(103)).toBe(0);
+    });
+  });
+
+  describe("sumUserAndKeyTotalCostBatch", () => {
+    test("computes both user and key totals in a single query including deleted-key user rows", async () => {
+      dbResultMock.mockReturnValueOnce([
+        { user_id: 1, key_id: 101, user_cost: "10.1", key_cost: "10.1" },
+        { user_id: 1, key_id: 102, user_cost: "5.2", key_cost: "2.0" },
+        // Historical cost from a deleted key still contributes to user 1 total
+        { user_id: 1, key_id: null, user_cost: "3.7", key_cost: "0" },
+        { user_id: 2, key_id: 201, user_cost: "4.5", key_cost: "4.5" },
+      ]);
+
+      const { sumUserAndKeyTotalCostBatch } = await import("@/repository/statistics");
+      const result = await sumUserAndKeyTotalCostBatch(
+        [
+          { userId: 1, resetAt: null },
+          { userId: 2, resetAt: new Date("2026-10-01T00:00:00Z") },
+          { userId: 3, resetAt: null },
+        ],
+        [
+          { keyId: 101, key: "sk-101", resetAt: null },
+          { keyId: 102, key: "sk-102", resetAt: new Date("2026-11-01T00:00:00Z") },
+          { keyId: 201, key: "sk-201", resetAt: new Date("2026-10-01T00:00:00Z") },
+        ],
+        Infinity
+      );
+
+      expect(dbExecuteMock).toHaveBeenCalledTimes(1);
+      expect(result.userCosts.get(1)).toBe(19);
+      expect(result.userCosts.get(2)).toBe(4.5);
+      expect(result.userCosts.get(3)).toBe(0);
+      expect(result.keyCosts.get(101)).toBe(10.1);
+      expect(result.keyCosts.get(102)).toBe(2);
+      expect(result.keyCosts.get(201)).toBe(4.5);
+    });
+
+    test("pushes earliest cutoff into WHERE when all targets are bounded", async () => {
+      dbResultMock.mockReturnValueOnce([
+        { user_id: 1, key_id: 101, user_cost: "7.25", key_cost: "7.25" },
+      ]);
+
+      const { sumUserAndKeyTotalCostBatch } = await import("@/repository/statistics");
+      const result = await sumUserAndKeyTotalCostBatch(
+        [{ userId: 1, resetAt: new Date("2026-10-01T00:00:00Z") }],
+        [{ keyId: 101, key: "sk-101", resetAt: new Date("2026-10-15T00:00:00Z") }],
+        Infinity
+      );
+
+      expect(dbExecuteMock).toHaveBeenCalledTimes(1);
+      expect(result.userCosts.get(1)).toBe(7.25);
+      expect(result.keyCosts.get(101)).toBe(7.25);
+    });
+
+    test("returns empty maps when both users and keys are empty", async () => {
+      const { sumUserAndKeyTotalCostBatch } = await import("@/repository/statistics");
+      const result = await sumUserAndKeyTotalCostBatch([], [], Infinity);
+      expect(result.userCosts.size).toBe(0);
+      expect(result.keyCosts.size).toBe(0);
+      expect(dbExecuteMock).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -813,6 +813,13 @@ export interface UserAndKeyTotalCostResult {
   keyCosts: Map<number, number>;
 }
 
+export interface UserAndKeySplitTotalCostResult {
+  settledUserCosts: Map<number, number>;
+  settledKeyCosts: Map<number, number>;
+  liveUserCosts: Map<number, number>;
+  liveKeyCosts: Map<number, number>;
+}
+
 // Keep combined single-pass VALUES parameter count well below PostgreSQL's 65,535 bind limit.
 const SINGLE_PASS_TOTAL_COST_MAX_PARAMS = 50000;
 
@@ -1125,6 +1132,229 @@ export async function sumUserAndKeyTotalCostBatch(
   }
 
   return { userCosts, keyCosts };
+}
+
+/**
+ * Single-pass batch query splitting user and key costs at `splitAt` into:
+ * - settled: created_at < splitAt (finalized historical rows safe to persist in a watermarked baseline)
+ * - live: created_at >= splitAt (recent/in-flight tail added on the fly without persisting)
+ *
+ * When `fromInclusive` is supplied, PostgreSQL uses idx_usage_ledger_created_at_desc_id
+ * to scan only the incremental delta window (typically a few milliseconds).
+ */
+export async function sumUserAndKeyTotalCostWindowBatch(
+  usersInput: readonly UserTotalCostTarget[],
+  keysInput: readonly KeyTotalCostTarget[],
+  options: {
+    fromInclusive?: Date | null;
+    splitAt: Date;
+  }
+): Promise<UserAndKeySplitTotalCostResult> {
+  const settledUserCosts = new Map<number, number>();
+  const settledKeyCosts = new Map<number, number>();
+  const liveUserCosts = new Map<number, number>();
+  const liveKeyCosts = new Map<number, number>();
+
+  const dedupedUsers = new Map<number, { userId: number; cutoff: Date | null }>();
+  for (const user of usersInput) {
+    settledUserCosts.set(user.userId, 0);
+    liveUserCosts.set(user.userId, 0);
+    dedupedUsers.set(user.userId, {
+      userId: user.userId,
+      cutoff: resolveTotalCostCutoff(Infinity, user.resetAt),
+    });
+  }
+
+  const dedupedKeys = new Map<string, { keyId: number; key: string; cutoff: Date | null }>();
+  for (const keyEntry of keysInput) {
+    settledKeyCosts.set(keyEntry.keyId, 0);
+    liveKeyCosts.set(keyEntry.keyId, 0);
+    if (keyEntry.key.length > 0) {
+      dedupedKeys.set(keyEntry.key, {
+        keyId: keyEntry.keyId,
+        key: keyEntry.key,
+        cutoff: resolveTotalCostCutoff(Infinity, keyEntry.resetAt),
+      });
+    }
+  }
+
+  const uniqueUsers = [...dedupedUsers.values()];
+  const uniqueKeys = [...dedupedKeys.values()];
+  if (uniqueUsers.length === 0 && uniqueKeys.length === 0) {
+    return { settledUserCosts, settledKeyCosts, liveUserCosts, liveKeyCosts };
+  }
+
+  const fromInclusive =
+    options.fromInclusive instanceof Date && !Number.isNaN(options.fromInclusive.getTime())
+      ? options.fromInclusive
+      : null;
+
+  let minCutoffClause = sql``;
+  if (fromInclusive) {
+    minCutoffClause = sql`AND ${usageLedger.createdAt} >= ${fromInclusive.toISOString()}::timestamptz`;
+  } else {
+    let minCutoff: Date | null = null;
+    let allTargetsBounded = true;
+    for (const u of uniqueUsers) {
+      if (!u.cutoff) {
+        allTargetsBounded = false;
+        break;
+      }
+      if (!minCutoff || u.cutoff < minCutoff) {
+        minCutoff = u.cutoff;
+      }
+    }
+    if (allTargetsBounded) {
+      for (const k of uniqueKeys) {
+        if (!k.cutoff) {
+          allTargetsBounded = false;
+          break;
+        }
+        if (!minCutoff || k.cutoff < minCutoff) {
+          minCutoff = k.cutoff;
+        }
+      }
+    }
+    if (allTargetsBounded && minCutoff) {
+      minCutoffClause = sql`AND ${usageLedger.createdAt} >= ${minCutoff.toISOString()}::timestamptz`;
+    }
+  }
+
+  const userCte =
+    uniqueUsers.length > 0
+      ? sql`VALUES ${sql.join(
+          uniqueUsers.map((u) =>
+            u.cutoff
+              ? sql`(${u.userId}::int, ${u.cutoff.toISOString()}::timestamptz)`
+              : sql`(${u.userId}::int, NULL::timestamptz)`
+          ),
+          sql`, `
+        )}`
+      : sql`SELECT NULL::int AS user_id, NULL::timestamptz AS cutoff WHERE false`;
+
+  const keyCte =
+    uniqueKeys.length > 0
+      ? sql`VALUES ${sql.join(
+          uniqueKeys.map((k) =>
+            k.cutoff
+              ? sql`(${k.key}::varchar, ${k.keyId}::int, ${k.cutoff.toISOString()}::timestamptz)`
+              : sql`(${k.key}::varchar, ${k.keyId}::int, NULL::timestamptz)`
+          ),
+          sql`, `
+        )}`
+      : sql`SELECT NULL::varchar AS key_str, NULL::int AS key_id, NULL::timestamptz AS cutoff WHERE false`;
+
+  const splitAtIso = options.splitAt.toISOString();
+
+  const rows = await db.execute(sql`
+    WITH user_targets(user_id, cutoff) AS (
+      ${userCte}
+    ),
+    key_targets(key_str, key_id, cutoff) AS (
+      ${keyCte}
+    )
+    SELECT
+      ${usageLedger.userId} AS user_id,
+      kt.key_id AS key_id,
+      COALESCE(
+        SUM(${usageLedger.costUsd}) FILTER (
+          WHERE ut.user_id IS NOT NULL
+            AND ${usageLedger.createdAt} < ${splitAtIso}::timestamptz
+            AND (ut.cutoff IS NULL OR ${usageLedger.createdAt} >= ut.cutoff)
+        ),
+        0
+      ) AS settled_user_cost,
+      COALESCE(
+        SUM(${usageLedger.costUsd}) FILTER (
+          WHERE ut.user_id IS NOT NULL
+            AND ${usageLedger.createdAt} >= ${splitAtIso}::timestamptz
+            AND (ut.cutoff IS NULL OR ${usageLedger.createdAt} >= ut.cutoff)
+        ),
+        0
+      ) AS live_user_cost,
+      COALESCE(
+        SUM(${usageLedger.costUsd}) FILTER (
+          WHERE kt.key_id IS NOT NULL
+            AND ${usageLedger.createdAt} < ${splitAtIso}::timestamptz
+            AND (kt.cutoff IS NULL OR ${usageLedger.createdAt} >= kt.cutoff)
+        ),
+        0
+      ) AS settled_key_cost,
+      COALESCE(
+        SUM(${usageLedger.costUsd}) FILTER (
+          WHERE kt.key_id IS NOT NULL
+            AND ${usageLedger.createdAt} >= ${splitAtIso}::timestamptz
+            AND (kt.cutoff IS NULL OR ${usageLedger.createdAt} >= kt.cutoff)
+        ),
+        0
+      ) AS live_key_cost
+    FROM ${usageLedger}
+    LEFT JOIN user_targets ut ON ut.user_id = ${usageLedger.userId}
+    LEFT JOIN key_targets kt ON kt.key_str = ${usageLedger.key}
+    WHERE (ut.user_id IS NOT NULL OR kt.key_id IS NOT NULL)
+      ${minCutoffClause}
+      AND ${LEDGER_BILLING_CONDITION}
+    GROUP BY ${usageLedger.userId}, kt.key_id
+  `);
+
+  const settledUserDec = new Map<number, Decimal>();
+  const liveUserDec = new Map<number, Decimal>();
+  const settledKeyDec = new Map<number, Decimal>();
+  const liveKeyDec = new Map<number, Decimal>();
+
+  for (const row of Array.from(rows) as Array<{
+    user_id: unknown;
+    key_id: unknown;
+    settled_user_cost: unknown;
+    live_user_cost: unknown;
+    settled_key_cost: unknown;
+    live_key_cost: unknown;
+  }>) {
+    const userId = Number(row.user_id);
+    if (settledUserCosts.has(userId)) {
+      if (row.settled_user_cost != null) {
+        settledUserDec.set(
+          userId,
+          (settledUserDec.get(userId) ?? new Decimal(0)).plus(
+            new Decimal(String(row.settled_user_cost))
+          )
+        );
+      }
+      if (row.live_user_cost != null) {
+        liveUserDec.set(
+          userId,
+          (liveUserDec.get(userId) ?? new Decimal(0)).plus(new Decimal(String(row.live_user_cost)))
+        );
+      }
+    }
+
+    if (row.key_id != null) {
+      const keyId = Number(row.key_id);
+      if (settledKeyCosts.has(keyId)) {
+        if (row.settled_key_cost != null) {
+          settledKeyDec.set(
+            keyId,
+            (settledKeyDec.get(keyId) ?? new Decimal(0)).plus(
+              new Decimal(String(row.settled_key_cost))
+            )
+          );
+        }
+        if (row.live_key_cost != null) {
+          liveKeyDec.set(
+            keyId,
+            (liveKeyDec.get(keyId) ?? new Decimal(0)).plus(new Decimal(String(row.live_key_cost)))
+          );
+        }
+      }
+    }
+  }
+
+  for (const [id, total] of settledUserDec) settledUserCosts.set(id, total.toNumber());
+  for (const [id, total] of liveUserDec) liveUserCosts.set(id, total.toNumber());
+  for (const [id, total] of settledKeyDec) settledKeyCosts.set(id, total.toNumber());
+  for (const [id, total] of liveKeyDec) liveKeyCosts.set(id, total.toNumber());
+
+  return { settledUserCosts, settledKeyCosts, liveUserCosts, liveKeyCosts };
 }
 
 /**

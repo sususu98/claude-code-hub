@@ -439,5 +439,42 @@ describe("statistics resetAt parameter", () => {
       expect(result.keyCosts.size).toBe(0);
       expect(dbExecuteMock).not.toHaveBeenCalled();
     });
+
+    test("sumUserAndKeyTotalCostWindowBatch splits settled vs live totals across rows", async () => {
+      dbResultMock.mockReturnValueOnce([
+        {
+          user_id: 1,
+          key_id: 101,
+          settled_user_cost: "100.25",
+          live_user_cost: "4.50",
+          settled_key_cost: "100.25",
+          live_key_cost: "4.50",
+        },
+        {
+          user_id: 1,
+          key_id: null,
+          settled_user_cost: "12.00",
+          live_user_cost: "0",
+          settled_key_cost: "0",
+          live_key_cost: "0",
+        },
+      ]);
+
+      const { sumUserAndKeyTotalCostWindowBatch } = await import("@/repository/statistics");
+      const result = await sumUserAndKeyTotalCostWindowBatch(
+        [{ userId: 1, resetAt: null }],
+        [{ keyId: 101, key: "sk-101", resetAt: null }],
+        {
+          fromInclusive: new Date("2026-11-22T00:00:00Z"),
+          splitAt: new Date("2026-11-23T01:00:00Z"),
+        }
+      );
+
+      expect(dbExecuteMock).toHaveBeenCalledTimes(1);
+      expect(result.settledUserCosts.get(1)).toBe(112.25);
+      expect(result.liveUserCosts.get(1)).toBe(4.5);
+      expect(result.settledKeyCosts.get(101)).toBe(100.25);
+      expect(result.liveKeyCosts.get(101)).toBe(4.5);
+    });
   });
 });

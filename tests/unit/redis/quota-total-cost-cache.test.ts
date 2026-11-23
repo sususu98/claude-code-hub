@@ -1,13 +1,22 @@
+import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getRedisClient } from "@/lib/redis/client";
 import {
   buildQuotaTotalCostCacheKey,
   getUsersAndKeysTotalCostWithCache,
   invalidateQuotaTotalCostCache,
+  QUOTA_TOTAL_COST_BASELINE_KEY,
   QUOTA_TOTAL_COST_CACHE_PREFIX,
+  QUOTA_TOTAL_COST_GEN_KEY,
+  QUOTA_TOTAL_COST_HOT_KEY,
+  QUOTA_TOTAL_COST_LOCK_KEY,
 } from "@/lib/redis/quota-total-cost-cache";
-import { scanPattern } from "@/lib/redis/scan-helper";
-import { sumUserAndKeyTotalCostBatch } from "@/repository/statistics";
+import {
+  sumKeyCostInTimeRangesBatch,
+  sumUserAndKeyTotalCostBatch,
+  sumUserAndKeyTotalCostWindowBatch,
+  sumUserCostInTimeRangesBatch,
+} from "@/repository/statistics";
 
 vi.mock("@/lib/logger", () => ({
   logger: {
@@ -22,13 +31,16 @@ vi.mock("@/lib/redis/client", () => ({
   getRedisClient: vi.fn(),
 }));
 
-vi.mock("@/lib/redis/scan-helper", () => ({
-  scanPattern: vi.fn(),
-}));
-
 vi.mock("@/repository/statistics", () => ({
   sumUserAndKeyTotalCostBatch: vi.fn(),
+  sumUserAndKeyTotalCostWindowBatch: vi.fn(),
+  sumUserCostInTimeRangesBatch: vi.fn(),
+  sumKeyCostInTimeRangesBatch: vi.fn(),
 }));
+
+function hashKey(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
 
 function createRedisMock() {
   return {
@@ -38,6 +50,7 @@ function createRedisMock() {
     set: vi.fn(),
     setex: vi.fn(),
     del: vi.fn(),
+    incr: vi.fn(),
     eval: vi.fn(),
   };
 }
@@ -79,40 +92,48 @@ describe("quota-total-cost-cache", () => {
     expect(k1).not.toBe(k3);
   });
 
-  it("returns cached maps on Redis hit without querying DB", async () => {
+  it("returns cached maps on hot Redis hit without querying DB", async () => {
     const redis = createRedisMock();
-    redis.get.mockResolvedValueOnce(
+    const users = [{ userId: 1, resetAt: null }];
+    const keys = [{ keyId: 10, key: "sk-10", resetAt: null }];
+    const digest = buildQuotaTotalCostCacheKey(users, keys, Infinity);
+
+    redis.mget.mockResolvedValueOnce([
       JSON.stringify({
+        digest,
         userCosts: [[1, 42.5]],
         keyCosts: [[10, 12.25]],
-      })
-    );
+      }),
+      null,
+      null,
+    ]);
     vi.mocked(getRedisClient).mockReturnValue(
       redis as unknown as ReturnType<typeof getRedisClient>
     );
 
-    const result = await getUsersAndKeysTotalCostWithCache(
-      [{ userId: 1, resetAt: null }],
-      [{ keyId: 10, key: "sk-10", resetAt: null }]
-    );
+    const result = await getUsersAndKeysTotalCostWithCache(users, keys);
 
     expect(result.userCosts.get(1)).toBe(42.5);
     expect(result.keyCosts.get(10)).toBe(12.25);
+    expect(sumUserAndKeyTotalCostWindowBatch).not.toHaveBeenCalled();
     expect(sumUserAndKeyTotalCostBatch).not.toHaveBeenCalled();
   });
 
-  it("computes once via single-pass DB query on cache miss, writes Redis, and releases lock with owner token", async () => {
+  it("builds baseline on cold miss, writes baseline + hot cache, and releases lock with owner token", async () => {
     const redis = createRedisMock();
-    redis.get.mockResolvedValueOnce(null);
+    redis.mget.mockResolvedValueOnce([null, null, null]);
     redis.set.mockResolvedValueOnce("OK");
-    redis.setex.mockResolvedValueOnce("OK");
+    redis.get.mockResolvedValueOnce(null); // gen unchanged
+    redis.setex.mockResolvedValue("OK");
     redis.eval.mockResolvedValueOnce(1);
     vi.mocked(getRedisClient).mockReturnValue(
       redis as unknown as ReturnType<typeof getRedisClient>
     );
-    vi.mocked(sumUserAndKeyTotalCostBatch).mockResolvedValueOnce({
-      userCosts: new Map([[1, 99.9]]),
-      keyCosts: new Map([[10, 50.1]]),
+    vi.mocked(sumUserAndKeyTotalCostWindowBatch).mockResolvedValueOnce({
+      settledUserCosts: new Map([[1, 90]]),
+      liveUserCosts: new Map([[1, 9.9]]),
+      settledKeyCosts: new Map([[10, 45]]),
+      liveKeyCosts: new Map([[10, 5.1]]),
     });
 
     const result = await getUsersAndKeysTotalCostWithCache(
@@ -120,16 +141,121 @@ describe("quota-total-cost-cache", () => {
       [{ keyId: 10, key: "sk-10", resetAt: null }]
     );
 
-    expect(sumUserAndKeyTotalCostBatch).toHaveBeenCalledTimes(1);
-    expect(redis.setex).toHaveBeenCalledTimes(1);
-    expect(redis.set).toHaveBeenCalledTimes(1);
+    expect(sumUserAndKeyTotalCostWindowBatch).toHaveBeenCalledTimes(1);
+    const callArgs = vi.mocked(sumUserAndKeyTotalCostWindowBatch).mock.calls[0];
+    expect(callArgs[2].fromInclusive).toBeUndefined();
+    expect(callArgs[2].splitAt).toBeInstanceOf(Date);
+
+    expect(redis.setex).toHaveBeenCalledWith(
+      QUOTA_TOTAL_COST_BASELINE_KEY,
+      7 * 24 * 60 * 60,
+      expect.any(String)
+    );
+    expect(redis.setex).toHaveBeenCalledWith(QUOTA_TOTAL_COST_HOT_KEY, 15, expect.any(String));
     const [lockKey, lockToken] = redis.set.mock.calls[0] as [string, string];
-    expect(lockKey.endsWith(":lock")).toBe(true);
+    expect(lockKey).toBe(QUOTA_TOTAL_COST_LOCK_KEY);
     expect(lockToken.length).toBeGreaterThan(0);
     expect(redis.eval).toHaveBeenCalledWith(expect.any(String), 1, lockKey, lockToken);
-    expect(redis.del).not.toHaveBeenCalled();
     expect(result.userCosts.get(1)).toBe(99.9);
     expect(result.keyCosts.get(10)).toBe(50.1);
+  });
+
+  it("uses fast incremental delta query when hot cache expired but baseline exists", async () => {
+    const redis = createRedisMock();
+    const watermarkMs = Date.now() - 45 * 60 * 1000; // 45m ago (> 30m lag + 5m advance threshold)
+    const baseline = {
+      watermarkMs,
+      users: { "1": { resetMs: "", cost: "100.25" } },
+      keys: { "10": { resetMs: "", keyHash: hashKey("sk-10"), cost: "40.5" } },
+    };
+    redis.mget.mockResolvedValueOnce([null, JSON.stringify(baseline), "3"]);
+    redis.get.mockResolvedValueOnce("3"); // gen unchanged
+    redis.setex.mockResolvedValue("OK");
+    vi.mocked(getRedisClient).mockReturnValue(
+      redis as unknown as ReturnType<typeof getRedisClient>
+    );
+    vi.mocked(sumUserAndKeyTotalCostWindowBatch).mockResolvedValueOnce({
+      settledUserCosts: new Map([[1, 10]]),
+      liveUserCosts: new Map([[1, 2.5]]),
+      settledKeyCosts: new Map([[10, 5]]),
+      liveKeyCosts: new Map([[10, 1.25]]),
+    });
+
+    const result = await getUsersAndKeysTotalCostWithCache(
+      [{ userId: 1, resetAt: null }],
+      [{ keyId: 10, key: "sk-10", resetAt: null }]
+    );
+
+    // Delta query runs with fromInclusive = watermarkMs and no full-table lock needed
+    expect(redis.set).not.toHaveBeenCalled();
+    expect(sumUserAndKeyTotalCostWindowBatch).toHaveBeenCalledTimes(1);
+    const deltaOpts = vi.mocked(sumUserAndKeyTotalCostWindowBatch).mock.calls[0][2];
+    expect(deltaOpts.fromInclusive?.getTime()).toBe(watermarkMs);
+    expect(result.userCosts.get(1)).toBe(112.75);
+    expect(result.keyCosts.get(10)).toBe(46.75);
+
+    // Baseline persisted with advanced watermark and settled total (100.25 + 10 = 110.25)
+    const baselineWrite = redis.setex.mock.calls.find(([k]) => k === QUOTA_TOTAL_COST_BASELINE_KEY);
+    expect(baselineWrite).toBeDefined();
+    const saved = JSON.parse(baselineWrite![2] as string);
+    expect(saved.watermarkMs).toBeGreaterThan(watermarkMs);
+    expect(saved.users["1"].cost).toBe("110.25");
+    expect(saved.keys["10"].cost).toBe("45.5");
+  });
+
+  it("backfills only newly added/reset entities without full-table rebuild", async () => {
+    const redis = createRedisMock();
+    const watermarkMs = Date.now() - 32 * 60 * 1000;
+    const baseline = {
+      watermarkMs,
+      users: { "1": { resetMs: "", cost: "200" } },
+      keys: { "10": { resetMs: "", keyHash: hashKey("sk-10"), cost: "200" } },
+    };
+    redis.mget.mockResolvedValueOnce([null, JSON.stringify(baseline), null]);
+    redis.get.mockResolvedValueOnce(null);
+    redis.setex.mockResolvedValue("OK");
+    vi.mocked(getRedisClient).mockReturnValue(
+      redis as unknown as ReturnType<typeof getRedisClient>
+    );
+    vi.mocked(sumUserCostInTimeRangesBatch).mockResolvedValueOnce(new Map([[2, 15]]));
+    vi.mocked(sumKeyCostInTimeRangesBatch).mockResolvedValueOnce(new Map([[20, 15]]));
+    vi.mocked(sumUserAndKeyTotalCostWindowBatch).mockResolvedValueOnce({
+      settledUserCosts: new Map([
+        [1, 0],
+        [2, 0],
+      ]),
+      liveUserCosts: new Map([
+        [1, 5],
+        [2, 3],
+      ]),
+      settledKeyCosts: new Map([
+        [10, 0],
+        [20, 0],
+      ]),
+      liveKeyCosts: new Map([
+        [10, 5],
+        [20, 3],
+      ]),
+    });
+
+    const result = await getUsersAndKeysTotalCostWithCache(
+      [
+        { userId: 1, resetAt: null },
+        { userId: 2, resetAt: null }, // newly added user
+      ],
+      [
+        { keyId: 10, key: "sk-10", resetAt: null },
+        { keyId: 20, key: "sk-20", resetAt: null }, // newly added key
+      ]
+    );
+
+    // Only missing entity (user 2, key 20) backfilled; no full rebuild lock acquired
+    expect(redis.set).not.toHaveBeenCalled();
+    expect(sumUserCostInTimeRangesBatch).toHaveBeenCalledTimes(1);
+    expect(sumKeyCostInTimeRangesBatch).toHaveBeenCalledTimes(1);
+    expect(result.userCosts.get(1)).toBe(205);
+    expect(result.userCosts.get(2)).toBe(18);
+    expect(result.keyCosts.get(20)).toBe(18);
   });
 
   it("deduplicates concurrent in-process calls via singleflight even when Redis is unavailable", async () => {
@@ -168,13 +294,13 @@ describe("quota-total-cost-cache", () => {
 
   it("propagates DB errors without double-querying and still releases lock", async () => {
     const redis = createRedisMock();
-    redis.get.mockResolvedValueOnce(null);
+    redis.mget.mockResolvedValueOnce([null, null, null]);
     redis.set.mockResolvedValueOnce("OK");
     redis.eval.mockResolvedValueOnce(1);
     vi.mocked(getRedisClient).mockReturnValue(
       redis as unknown as ReturnType<typeof getRedisClient>
     );
-    vi.mocked(sumUserAndKeyTotalCostBatch).mockRejectedValueOnce(new Error("pg timeout"));
+    vi.mocked(sumUserAndKeyTotalCostWindowBatch).mockRejectedValueOnce(new Error("pg timeout"));
 
     await expect(
       getUsersAndKeysTotalCostWithCache(
@@ -183,46 +309,51 @@ describe("quota-total-cost-cache", () => {
       )
     ).rejects.toThrow("pg timeout");
 
-    expect(sumUserAndKeyTotalCostBatch).toHaveBeenCalledTimes(1);
+    expect(sumUserAndKeyTotalCostWindowBatch).toHaveBeenCalledTimes(1);
+    expect(sumUserAndKeyTotalCostBatch).not.toHaveBeenCalled();
     expect(redis.eval).toHaveBeenCalledTimes(1);
   });
 
-  it("stops waiting early and queries DB once when lock disappears without cache fill", async () => {
+  it("invalidates full cache in O(1) and scoped cache without nuking other entities", async () => {
     const redis = createRedisMock();
-    redis.get.mockResolvedValueOnce(null);
-    redis.set.mockResolvedValueOnce(null); // lock held by another worker
-    redis.mget.mockResolvedValueOnce([null, null]); // lock gone, cache empty
+    redis.del.mockResolvedValue(1);
+    redis.incr.mockResolvedValue(2);
     vi.mocked(getRedisClient).mockReturnValue(
       redis as unknown as ReturnType<typeof getRedisClient>
     );
-    vi.mocked(sumUserAndKeyTotalCostBatch).mockResolvedValueOnce({
-      userCosts: new Map([[11, 33]]),
-      keyCosts: new Map([[110, 33]]),
-    });
-
-    const result = await getUsersAndKeysTotalCostWithCache(
-      [{ userId: 11, resetAt: null }],
-      [{ keyId: 110, key: "sk-110", resetAt: null }]
-    );
-
-    expect(redis.mget).toHaveBeenCalledTimes(1);
-    expect(sumUserAndKeyTotalCostBatch).toHaveBeenCalledTimes(1);
-    expect(result.userCosts.get(11)).toBe(33);
-  });
-
-  it("invalidates cached snapshots while skipping lock keys", async () => {
-    const redis = createRedisMock();
-    redis.del.mockResolvedValueOnce(1);
-    vi.mocked(getRedisClient).mockReturnValue(
-      redis as unknown as ReturnType<typeof getRedisClient>
-    );
-    vi.mocked(scanPattern).mockResolvedValueOnce([
-      `${QUOTA_TOTAL_COST_CACHE_PREFIX}abc`,
-      `${QUOTA_TOTAL_COST_CACHE_PREFIX}abc:lock`,
-    ]);
 
     await invalidateQuotaTotalCostCache();
+    expect(redis.del).toHaveBeenCalledWith(QUOTA_TOTAL_COST_HOT_KEY, QUOTA_TOTAL_COST_BASELINE_KEY);
+    expect(redis.incr).toHaveBeenCalledWith(QUOTA_TOTAL_COST_GEN_KEY);
 
-    expect(redis.del).toHaveBeenCalledWith(`${QUOTA_TOTAL_COST_CACHE_PREFIX}abc`);
+    // Scoped invalidation prunes only affected user/key while keeping others intact
+    vi.clearAllMocks();
+    redis.del.mockResolvedValue(1);
+    redis.setex.mockResolvedValue("OK");
+    redis.get.mockResolvedValueOnce(
+      JSON.stringify({
+        watermarkMs: Date.now() - 35 * 60 * 1000,
+        users: {
+          "1": { resetMs: "", cost: "100" },
+          "2": { resetMs: "", cost: "50" },
+        },
+        keys: {
+          "10": { resetMs: "", keyHash: hashKey("sk-10"), cost: "100" },
+          "20": { resetMs: "", keyHash: hashKey("sk-20"), cost: "50" },
+        },
+      })
+    );
+    vi.mocked(getRedisClient).mockReturnValue(
+      redis as unknown as ReturnType<typeof getRedisClient>
+    );
+
+    await invalidateQuotaTotalCostCache({ userIds: [1], keyIds: [10] });
+    expect(redis.del).toHaveBeenCalledWith(QUOTA_TOTAL_COST_HOT_KEY);
+    expect(redis.setex).toHaveBeenCalledTimes(1);
+    const updated = JSON.parse(redis.setex.mock.calls[0][2] as string);
+    expect(updated.users["1"]).toBeUndefined();
+    expect(updated.users["2"]).toEqual({ resetMs: "", cost: "50" });
+    expect(updated.keys["10"]).toBeUndefined();
+    expect(updated.keys["20"]).toBeDefined();
   });
 });

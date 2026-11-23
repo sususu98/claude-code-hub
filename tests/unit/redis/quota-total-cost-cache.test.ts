@@ -34,6 +34,7 @@ function createRedisMock() {
   return {
     status: "ready",
     get: vi.fn(),
+    mget: vi.fn(),
     set: vi.fn(),
     setex: vi.fn(),
     del: vi.fn(),
@@ -163,6 +164,50 @@ describe("quota-total-cost-cache", () => {
     expect(sumUserAndKeyTotalCostBatch).toHaveBeenCalledTimes(1);
     expect(r1.userCosts.get(7)).toBe(15);
     expect(r2.userCosts.get(7)).toBe(15);
+  });
+
+  it("propagates DB errors without double-querying and still releases lock", async () => {
+    const redis = createRedisMock();
+    redis.get.mockResolvedValueOnce(null);
+    redis.set.mockResolvedValueOnce("OK");
+    redis.eval.mockResolvedValueOnce(1);
+    vi.mocked(getRedisClient).mockReturnValue(
+      redis as unknown as ReturnType<typeof getRedisClient>
+    );
+    vi.mocked(sumUserAndKeyTotalCostBatch).mockRejectedValueOnce(new Error("pg timeout"));
+
+    await expect(
+      getUsersAndKeysTotalCostWithCache(
+        [{ userId: 9, resetAt: null }],
+        [{ keyId: 90, key: "sk-90", resetAt: null }]
+      )
+    ).rejects.toThrow("pg timeout");
+
+    expect(sumUserAndKeyTotalCostBatch).toHaveBeenCalledTimes(1);
+    expect(redis.eval).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops waiting early and queries DB once when lock disappears without cache fill", async () => {
+    const redis = createRedisMock();
+    redis.get.mockResolvedValueOnce(null);
+    redis.set.mockResolvedValueOnce(null); // lock held by another worker
+    redis.mget.mockResolvedValueOnce([null, null]); // lock gone, cache empty
+    vi.mocked(getRedisClient).mockReturnValue(
+      redis as unknown as ReturnType<typeof getRedisClient>
+    );
+    vi.mocked(sumUserAndKeyTotalCostBatch).mockResolvedValueOnce({
+      userCosts: new Map([[11, 33]]),
+      keyCosts: new Map([[110, 33]]),
+    });
+
+    const result = await getUsersAndKeysTotalCostWithCache(
+      [{ userId: 11, resetAt: null }],
+      [{ keyId: 110, key: "sk-110", resetAt: null }]
+    );
+
+    expect(redis.mget).toHaveBeenCalledTimes(1);
+    expect(sumUserAndKeyTotalCostBatch).toHaveBeenCalledTimes(1);
+    expect(result.userCosts.get(11)).toBe(33);
   });
 
   it("invalidates cached snapshots while skipping lock keys", async () => {

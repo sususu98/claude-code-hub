@@ -109,22 +109,33 @@ async function computeWithRedisCache(
   const lockKey = `${cacheKey}:lock`;
   const lockToken = randomUUID();
   let locked = false;
-  let computed: UserAndKeyTotalCostResult | undefined;
 
   try {
-    const cached = await redis.get(cacheKey);
-    if (cached) {
-      const parsed = deserializeResult(cached);
-      if (parsed) {
-        return parsed;
+    // 1. Check Redis cache and try acquiring the computation lock.
+    //    Redis errors here degrade cleanly to a single direct DB query.
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        const parsed = deserializeResult(cached);
+        if (parsed) {
+          return parsed;
+        }
       }
+
+      const lockResult = await redis.set(lockKey, lockToken, "EX", LOCK_TTL_SECONDS, "NX");
+      locked = lockResult === "OK";
+    } catch (redisErr) {
+      logger.warn("[QuotaTotalCostCache] Redis error, falling back to direct query", {
+        cacheKey,
+        error: redisErr instanceof Error ? redisErr.message : String(redisErr),
+      });
+      return await sumUserAndKeyTotalCostBatch(users, keys, maxAgeDays);
     }
 
-    const lockResult = await redis.set(lockKey, lockToken, "EX", LOCK_TTL_SECONDS, "NX");
-    locked = lockResult === "OK";
-
+    // 2. Lock owner computes once from DB. DB errors propagate directly without
+    //    being mistaken for Redis failures or retried a second time.
     if (locked) {
-      computed = await sumUserAndKeyTotalCostBatch(users, keys, maxAgeDays);
+      const computed = await sumUserAndKeyTotalCostBatch(users, keys, maxAgeDays);
       try {
         await redis.setex(cacheKey, CACHE_TTL_SECONDS, serializeResult(computed));
       } catch (writeErr) {
@@ -136,28 +147,43 @@ async function computeWithRedisCache(
       return computed;
     }
 
-    // Another worker is computing the single-pass aggregation; wait for the cached value.
-    for (let i = 0; i < MAX_LOCK_WAIT_RETRIES; i++) {
-      await sleep(RETRY_INTERVAL_MS);
-      const retried = await redis.get(cacheKey);
-      if (retried) {
-        const parsed = deserializeResult(retried);
-        if (parsed) {
-          return parsed;
+    // 3. Another worker holds the lock; poll until the cache is populated or the lock disappears.
+    try {
+      for (let i = 0; i < MAX_LOCK_WAIT_RETRIES; i++) {
+        await sleep(RETRY_INTERVAL_MS);
+        const [retried, lockValue] =
+          typeof redis.mget === "function"
+            ? await redis.mget(cacheKey, lockKey)
+            : [await redis.get(cacheKey), "1"];
+        if (retried) {
+          const parsed = deserializeResult(retried);
+          if (parsed) {
+            return parsed;
+          }
+        }
+        if (lockValue === null) {
+          // Lock holder released without populating cache (e.g. DB error); stop waiting early.
+          break;
         }
       }
+    } catch (waitErr) {
+      logger.warn(
+        "[QuotaTotalCostCache] Redis error while waiting for lock, falling back to direct query",
+        {
+          cacheKey,
+          error: waitErr instanceof Error ? waitErr.message : String(waitErr),
+        }
+      );
+      return await sumUserAndKeyTotalCostBatch(users, keys, maxAgeDays);
     }
 
-    logger.warn("[QuotaTotalCostCache] Lock wait timeout, falling back to direct query", {
-      cacheKey,
-    });
+    logger.warn(
+      "[QuotaTotalCostCache] Lock wait ended without cached value, falling back to direct query",
+      {
+        cacheKey,
+      }
+    );
     return await sumUserAndKeyTotalCostBatch(users, keys, maxAgeDays);
-  } catch (error) {
-    logger.warn("[QuotaTotalCostCache] Redis error, falling back to direct query", {
-      cacheKey,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return computed ?? (await sumUserAndKeyTotalCostBatch(users, keys, maxAgeDays));
   } finally {
     if (locked) {
       const releasePromise =
